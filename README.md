@@ -1,4 +1,4 @@
-能够设置v4优先的 Shadowsocks 和 SOCKS5 安装管理脚本，基于Xray，仅在Debian/Ubuntu测试
+可以设置v4优先的 Shadowsocks 和 SOCKS5 安装管理脚本，基于Xray，仅在Debian/Ubuntu测试
 
 ```
 bash <(curl -Ls https://raw.githubusercontent.com/cyeinfpro/Shadowsocks-v4first/refs/heads/main/Shadowsocks-v4first.sh)
