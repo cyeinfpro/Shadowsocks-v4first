@@ -1,6 +1,15 @@
 #!/bin/bash
 
-# 检查是否以 root 身份运行
+#=====================================================
+#   Xray 多入站、多出站管理脚本（含卸载 Xray 选项）
+#   - Shadowsocks 默认端口 28001, Socks5 入站默认 55555
+#   - 添加入站时检查端口冲突
+#   - 添加入站时可选 IPv4 优先
+#   - 代理链出站：仅对指定 inbound（删除原出站规则后添加新的）
+#   - 删除 代理链出站 时，自动还原 IPv4 优先
+#   - 在删除各项时，列出现有资源供用户选择数字，而非手动输入 tag
+#=====================================================
+
 if [ "$EUID" -ne 0 ]; then
     echo "请以 root 用户运行此脚本。"
     exit 1
@@ -9,26 +18,25 @@ fi
 apt-get update
 apt-get install -y jq curl
 
-# 配置文件路径
 config_json="/usr/local/etc/xray/config.json"
-ss_config="/usr/local/etc/xray/ss_config"
-socks_config="/usr/local/etc/xray/socks_config"
 
 # Shadowsocks 支持的加密方式列表
 supported_methods=("aes-256-gcm" "aes-128-gcm" "chacha20-ietf-poly1305" "xchacha20-ietf-poly1305" "2022-blake3-aes-256-gcm" "2022-blake3-chacha20-poly1305" "aes-256-cfb" "aes-128-cfb" "aes-256-ctr" "rc4-md5")
 
-# 生成随机强密码函数
+############################################
+# 生成随机密码
+############################################
 generate_password() {
     tr -dc 'A-Za-z0-9' </dev/urandom | head -c 16
 }
 
-# 初始化配置文件
+############################################
+# 初始化 config.json
+############################################
 init_config() {
-    # 确保配置目录存在
-    mkdir -p $(dirname "$config_json")
-
+    mkdir -p "$(dirname "$config_json")"
     if [ ! -f "$config_json" ]; then
-        cat <<EOF > "$config_json"
+cat <<EOF > "$config_json"
 {
   "log": {
     "access": "/var/log/xray/access.log",
@@ -48,75 +56,40 @@ EOF
     fi
 }
 
-# 添加或更新 Shadowsocks 入站配置
-update_ss_inbound() {
-    # 确保配置目录存在
-    mkdir -p $(dirname "$config_json")
-
-    # 移除已有的 Shadowsocks 入站配置
-    jq 'del(.inbounds[] | select(.protocol == "shadowsocks"))' "$config_json" > tmp_config.json && mv tmp_config.json "$config_json"
-
-    # 添加新的 Shadowsocks 入站配置
-    jq '.inbounds += [{
-        "port": '"$1"',
-        "protocol": "shadowsocks",
-        "settings": {
-            "method": "'"$2"'",
-            "password": "'"$3"'",
-            "network": "tcp,udp"
-        },
-        "sniffing": {
-            "enabled": true,
-            "destOverride": ["http", "tls"]
-        }
-    }]' "$config_json" > tmp_config.json && mv tmp_config.json "$config_json"
-}
-
-# 添加或更新 SOCKS5 入站配置
-update_socks_inbound() {
-    # 确保配置目录存在
-    mkdir -p $(dirname "$config_json")
-
-    # 移除已有的 SOCKS5 入站配置
-    jq 'del(.inbounds[] | select(.protocol == "socks"))' "$config_json" > tmp_config.json && mv tmp_config.json "$config_json"
-
-    # 设置认证配置
-    if [ "$4" == "password" ]; then
-        auth_config='{
-            "auth": "password",
-            "accounts": [{
-                "user": "'"$2"'",
-                "pass": "'"$3"'"
-            }],
-            "udp": true
-        }'
-    else
-        auth_config='{
-            "auth": "noauth",
-            "udp": true
-        }'
+############################################
+# 安装 Xray（如未安装）
+############################################
+install_xray_if_needed() {
+    if ! command -v xray >/dev/null 2>&1; then
+        echo "正在安装 Xray..."
+        bash <(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh) install
+        systemctl enable xray
     fi
-
-    # 添加新的 SOCKS5 入站配置
-    jq --argjson auth_settings "$auth_config" '.inbounds += [{
-        "port": '"$1"',
-        "listen": "0.0.0.0",
-        "protocol": "socks",
-        "settings": $auth_settings,
-        "sniffing": {
-            "enabled": true,
-            "destOverride": ["http", "tls"]
-        }
-    }]' "$config_json" > tmp_config.json && mv tmp_config.json "$config_json"
 }
 
-# 更新出站和路由配置
-update_outbound_routing() {
-    # 确保配置目录存在
-    mkdir -p $(dirname "$config_json")
+############################################
+# 检测端口是否已被当前 Xray 配置的 inbound 占用
+############################################
+port_conflict_check() {
+    local port=$1
+    if [ -f "$config_json" ]; then
+        local all_ports
+        all_ports=$(jq -r '.inbounds[]?.port' "$config_json" 2>/dev/null)
+        if [ -n "$all_ports" ]; then
+            if echo "$all_ports" | grep -q -w "$port"; then
+                return 1  # 表示冲突
+            fi
+        fi
+    fi
+    return 0  # 无冲突
+}
 
-    if [ "$1" == "true" ]; then
-        # 配置启用 IPv4 优先的 outbounds 和 routing
+############################################
+# 设置(或重置)IPv4优先 (true=开启, false=关闭)
+############################################
+set_ipv4_priority() {
+    local enable_ipv4="$1"
+    if [ "$enable_ipv4" == "true" ]; then
         jq '.outbounds = [
             {
                 "tag": "IP4",
@@ -135,58 +108,504 @@ update_outbound_routing() {
         ]' "$config_json" > tmp_config.json && mv tmp_config.json "$config_json"
 
         jq '.routing = {
-            "domainStrategy": "IPIfNonMatch",
-            "rules": [
-                {
-                    "type": "field",
-                    "outboundTag": "IP4",
-                    "network": "tcp,udp"
-                },
-                {
-                    "type": "field",
-                    "ip": ["::/0"],
-                    "outboundTag": "IP6"
-                }
+            "domainStrategy":"IPIfNonMatch",
+            "rules":[
+              {
+                "type":"field",
+                "outboundTag":"IP4",
+                "network":"tcp,udp"
+              },
+              {
+                "type":"field",
+                "ip":["::/0"],
+                "outboundTag":"IP6"
+              }
             ]
         }' "$config_json" > tmp_config.json && mv tmp_config.json "$config_json"
     else
-        # 配置默认的 outbound，并删除 routing
-        jq '.outbounds = [{
-            "protocol": "freedom",
-            "settings": {}
-        }] | del(.routing)' "$config_json" > tmp_config.json && mv tmp_config.json "$config_json"
+        # 默认 => freedom 出站 & 清空 routing
+        jq '.outbounds = [{"protocol":"freedom","settings":{}}] | del(.routing)' "$config_json" > tmp_config.json && mv tmp_config.json "$config_json"
     fi
 }
 
-# 执行网络优化
+############################################
+# Shadowsocks 入站管理
+############################################
+add_shadowsocks_inbound() {
+    init_config
+    install_xray_if_needed
+
+    while true; do
+        read -rp "请输入 Shadowsocks 入站端口（默认 28001，输入 0 返回上一级）： " port
+        if [ "$port" = "0" ]; then
+            break
+        fi
+        port=${port:-28001}
+
+        if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -le 0 ] || [ "$port" -gt 65535 ]; then
+            echo "错误：端口号无效。"
+            continue
+        fi
+        port_conflict_check "$port"
+        if [ $? -ne 0 ]; then
+            echo "端口冲突！当前 Xray 已使用端口 $port。"
+            continue
+        fi
+
+        read -rp "请输入 Shadowsocks 密码（留空生成随机密码，输入 0 返回上一级）： " password
+        if [ "$password" = "0" ]; then
+            break
+        fi
+        password=${password:-$(generate_password)}
+
+        echo "请选择 Shadowsocks 加密方式："
+        for i in "${!supported_methods[@]}"; do
+            echo "$((i+1)). ${supported_methods[$i]}"
+        done
+        echo "0. 返回上一级"
+        local method method_choice
+        while true; do
+            read -rp "请输入选项（0-${#supported_methods[@]}，默认1）： " method_choice
+            method_choice=${method_choice:-1}
+            if [ "$method_choice" = "0" ]; then
+                break 2
+            fi
+            if ! [[ "$method_choice" =~ ^[0-9]+$ ]] || [ "$method_choice" -lt 1 ] || [ "$method_choice" -gt "${#supported_methods[@]}" ]; then
+                echo "错误：请输入有效选项。"
+                continue
+            fi
+            method="${supported_methods[$((method_choice-1))]}"
+            break
+        done
+
+        read -rp "是否启用 IPv4 优先？(y/n，默认 y)： " ipv4_choice
+        ipv4_choice=${ipv4_choice:-y}
+        if [[ "$ipv4_choice" =~ ^[Yy]$ ]]; then
+            set_ipv4_priority "true"
+        else
+            set_ipv4_priority "false"
+        fi
+
+        local inbound_tag="ss-inbound-$port"
+
+        jq --arg inbound_tag "$inbound_tag" --argjson port "$port" --arg method "$method" --arg password "$password" '
+          .inbounds += [
+            {
+              "tag": $inbound_tag,
+              "port": $port,
+              "listen": "0.0.0.0",
+              "protocol": "shadowsocks",
+              "settings": {
+                "method": $method,
+                "password": $password,
+                "network": "tcp,udp"
+              },
+              "sniffing": {
+                "enabled": true,
+                "destOverride": ["http","tls"]
+              }
+            }
+          ]
+        ' "$config_json" > tmp_config.json && mv tmp_config.json "$config_json"
+
+        if ! xray -test -c "$config_json"; then
+            echo "错误：Xray 配置文件无效。"
+            break
+        fi
+
+        systemctl restart xray
+        echo "已添加 Shadowsocks 入站：port=$port, password=$password, method=$method, tag=$inbound_tag"
+        break
+    done
+}
+
+remove_shadowsocks_inbound() {
+    init_config
+    install_xray_if_needed
+
+    # 列出 Shadowsocks inbound 列表
+    local ss_inbounds
+    ss_inbounds=$(jq -r '.inbounds[] | select(.protocol=="shadowsocks") | .tag' "$config_json")
+    if [ -z "$ss_inbounds" ]; then
+        echo "当前没有任何 Shadowsocks 入站。"
+        return
+    fi
+
+    IFS=$'\n' read -rd '' -a ss_array <<< "$ss_inbounds"
+    echo "---------- Shadowsocks 入站列表 ----------"
+    for i in "${!ss_array[@]}"; do
+        echo "$((i+1)). ${ss_array[$i]}"
+    done
+    echo "0. 返回上一级"
+    echo "-----------------------------------------"
+
+    while true; do
+        read -rp "请选择要删除的 Shadowsocks 入站（数字）： " choice
+        if [ "$choice" = "0" ]; then
+            break
+        fi
+        if ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt "${#ss_array[@]}" ]; then
+            echo "无效选项。"
+            continue
+        fi
+
+        local del_tag="${ss_array[$((choice-1))]}"
+        jq --arg del_tag "$del_tag" 'del(.inbounds[] | select(.tag == $del_tag))' "$config_json" > tmp_config.json && mv tmp_config.json "$config_json"
+
+        if ! xray -test -c "$config_json"; then
+            echo "错误：更新后配置无效。"
+            break
+        fi
+
+        systemctl restart xray
+        echo "Shadowsocks 入站 [$del_tag] 已删除。"
+        break
+    done
+}
+
+############################################
+# Socks5 入站管理
+############################################
+add_socks_inbound() {
+    init_config
+    install_xray_if_needed
+
+    while true; do
+        read -rp "请输入 Socks5 入站端口（默认 55555，输入 0 返回）： " port
+        if [ "$port" = "0" ]; then
+            break
+        fi
+        port=${port:-55555}
+
+        if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -le 0 ] || [ "$port" -gt 65535 ]; then
+            echo "错误：端口号无效。"
+            continue
+        fi
+        port_conflict_check "$port"
+        if [ $? -ne 0 ]; then
+            echo "端口冲突！当前 Xray 已使用端口 $port。"
+            continue
+        fi
+
+        read -rp "是否启用 IPv4 优先？(y/n，默认 y)： " ipv4_choice
+        ipv4_choice=${ipv4_choice:-y}
+        if [[ "$ipv4_choice" =~ ^[Yy]$ ]]; then
+            set_ipv4_priority "true"
+        else
+            set_ipv4_priority "false"
+        fi
+
+        local inbound_tag="socks-inbound-$port"
+        read -rp "是否需要用户名密码认证？(y/n，默认 n)： " auth_choice
+        auth_choice=${auth_choice:-n}
+
+        local auth_config
+        if [[ "$auth_choice" =~ ^[Yy]$ ]]; then
+            read -rp "请输入用户名：" s5_user
+            read -rp "请输入密码：" s5_pass
+            auth_config=$(jq -nc --arg user "$s5_user" --arg pass "$s5_pass" '
+              {
+                "auth": "password",
+                "accounts": [ { "user": $user, "pass": $pass } ],
+                "udp": true
+              }
+            ')
+        else
+            auth_config='{"auth":"noauth","udp":true}'
+        fi
+
+        jq --argjson auth_settings "$auth_config" --arg inbound_tag "$inbound_tag" --argjson port "$port" '
+          .inbounds += [
+            {
+              "tag": $inbound_tag,
+              "port": $port,
+              "listen": "0.0.0.0",
+              "protocol": "socks",
+              "settings": $auth_settings,
+              "sniffing": {
+                "enabled": true,
+                "destOverride": ["http","tls"]
+              }
+            }
+          ]
+        ' "$config_json" > tmp_config.json && mv tmp_config.json "$config_json"
+
+        if ! xray -test -c "$config_json"; then
+            echo "错误：Xray 配置文件无效。"
+            break
+        fi
+
+        systemctl restart xray
+        echo "已添加 Socks5 入站：port=$port, tag=$inbound_tag"
+        break
+    done
+}
+
+remove_socks_inbound() {
+    init_config
+    install_xray_if_needed
+
+    local s5_inbounds
+    s5_inbounds=$(jq -r '.inbounds[] | select(.protocol=="socks") | .tag' "$config_json")
+    if [ -z "$s5_inbounds" ]; then
+        echo "当前没有任何 Socks5 入站。"
+        return
+    fi
+
+    IFS=$'\n' read -rd '' -a s5_array <<< "$s5_inbounds"
+    echo "---------- Socks5 入站列表 ----------"
+    for i in "${!s5_array[@]}"; do
+        echo "$((i+1)). ${s5_array[$i]}"
+    done
+    echo "0. 返回上一级"
+    echo "-------------------------------------"
+
+    while true; do
+        read -rp "请选择要删除的 Socks5 入站（数字）： " choice
+        if [ "$choice" = "0" ]; then
+            break
+        fi
+        if ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt "${#s5_array[@]}" ]; then
+            echo "无效选项。"
+            continue
+        fi
+
+        local del_tag="${s5_array[$((choice-1))]}"
+        jq --arg del_tag "$del_tag" 'del(.inbounds[] | select(.tag == $del_tag))' "$config_json" > tmp_config.json && mv tmp_config.json "$config_json"
+
+        if ! xray -test -c "$config_json"; then
+            echo "错误：更新后配置无效。"
+            break
+        fi
+
+        systemctl restart xray
+        echo "Socks5 入站 [$del_tag] 已删除。"
+        break
+    done
+}
+
+############################################
+# 代理链出站管理（原 Socks5 出站）
+############################################
+add_socks_outbound() {
+    init_config
+    install_xray_if_needed
+
+    while true; do
+        read -rp "为新代理链出站指定一个 tag（例：my-s5-out，输入0返回）： " out_tag
+        if [ "$out_tag" = "0" ]; then
+            break
+        fi
+        if [ -z "$out_tag" ]; then
+            echo "错误：tag 不能为空。"
+            continue
+        fi
+
+        read -rp "外部 S5 服务器地址（IP/域名）： " s5_addr
+        if [ -z "$s5_addr" ]; then
+            echo "错误：地址不能为空。"
+            continue
+        fi
+        read -rp "外部 S5 服务器端口（默认1080）： " s5_port
+        s5_port=${s5_port:-1080}
+        if ! [[ "$s5_port" =~ ^[0-9]+$ ]] || [ "$s5_port" -le 0 ] || [ "$s5_port" -gt 65535 ]; then
+            echo "错误：端口无效。"
+            continue
+        fi
+
+        read -rp "是否需要用户名密码认证？(y/n，默认 n)： " s5_auth_choice
+        s5_auth_choice=${s5_auth_choice:-n}
+        local s5_auth=''
+        if [[ "$s5_auth_choice" =~ ^[Yy]$ ]]; then
+            read -rp "S5 用户名：" s5_user
+            read -rp "S5 密码：" s5_pass
+            s5_auth=$(jq -nc --arg user "$s5_user" --arg pass "$s5_pass" '{user:$user,pass:$pass}')
+        fi
+
+        # 先插入一个新的 socks outbound
+        jq --arg out_tag "$out_tag" --arg s5_addr "$s5_addr" --argjson s5_port "$s5_port" --argjson s5_auth "$s5_auth" '
+          .outbounds += [
+            {
+              "tag": $out_tag,
+              "protocol": "socks",
+              "settings": {
+                "servers": [
+                  if $s5_auth == "" then
+                    {"address": $s5_addr, "port": $s5_port}
+                  else
+                    {"address": $s5_addr, "port": $s5_port, "users":[ $s5_auth ]}
+                  end
+                ]
+              }
+            }
+          ]
+        ' "$config_json" > tmp_config.json && mv tmp_config.json "$config_json"
+
+        local inbound_tags
+        inbound_tags=$(jq -r '.inbounds[]?.tag // empty' "$config_json")
+        if [ -z "$inbound_tags" ]; then
+            echo "当前没有任何 inbound，无法路由。"
+            echo "如果之后添加 inbound，再自行编辑 routing。"
+        else
+            echo "========== 请选择要路由到该代理链出站的 inbound =========="
+            IFS=$'\n' read -rd '' -a inbound_array <<< "$inbound_tags"
+
+            for i in "${!inbound_array[@]}"; do
+                echo "$((i+1)). ${inbound_array[$i]}"
+            done
+            echo "0. 不设置路由（以后手动改）"
+            echo "--------------------------------------------"
+            read -rp "请输入要路由的 inbound 序号(可用逗号分隔多个): " selected_indexes
+            if [ "$selected_indexes" = "0" ]; then
+                echo "不设置任何 routing rule。"
+            else
+                IFS=',' read -ra idx_arr <<< "$selected_indexes"
+                local rule_json=""
+                for idx in "${idx_arr[@]}"; do
+                    idx=$(echo "$idx" | xargs)
+                    if ! [[ "$idx" =~ ^[0-9]+$ ]]; then
+                        echo "无效序号: $idx"
+                        continue
+                    fi
+                    idx=$((idx-1))
+                    if [ $idx -lt 0 ] || [ $idx -ge ${#inbound_array[@]} ]; then
+                        echo "序号越界: $((idx+1))"
+                        continue
+                    fi
+                    local inbound_tag="${inbound_array[$idx]}"
+
+                    # 先删除该 inbound_tag 之前的路由
+                    jq --arg inbound_tag "$inbound_tag" '
+                      if .routing.rules? then
+                        .routing.rules = (.routing.rules | map(
+                          select( ((.inboundTag // []) | inside([$inbound_tag])) | not )
+                        ))
+                      else
+                        .
+                      end
+                    ' "$config_json" > tmp_config.json && mv tmp_config.json "$config_json"
+
+                    # 生成新的路由rule: 用单元素数组
+                    local rule_entry
+                    rule_entry=$(jq -nc --arg inbound_tag "$inbound_tag" --arg out_tag "$out_tag" '
+                      [
+                        {
+                          "type": "field",
+                          "inboundTag": [$inbound_tag],
+                          "outboundTag": $out_tag
+                        }
+                      ]
+                    ')
+
+                    if [ -z "$rule_json" ]; then
+                        rule_json="$rule_entry"
+                    else
+                        rule_json=$(jq -s '.[0] + .[1]' <(echo "$rule_json") <(echo "$rule_entry"))
+                    fi
+                done
+
+                if [ -n "$rule_json" ]; then
+                    if ! jq '.routing' "$config_json" | grep -q '{'; then
+                        jq '.routing = {"domainStrategy":"IPOnDemand","rules":[]}' "$config_json" > tmp_config.json && mv tmp_config.json "$config_json"
+                    fi
+                    jq --argjson newrules "$rule_json" '
+                      .routing.rules += $newrules
+                    ' "$config_json" > tmp_config.json && mv tmp_config.json "$config_json"
+                fi
+            fi
+        fi
+
+        if ! xray -test -c "$config_json"; then
+            echo "错误：Xray 配置无效，请检查输入。"
+            break
+        fi
+
+        systemctl restart xray
+        echo "已添加 代理链出站(tag=$out_tag)，地址：$s5_addr:$s5_port。"
+        break
+    done
+}
+
+remove_socks_outbound() {
+    init_config
+    install_xray_if_needed
+
+    local outbound_list
+    outbound_list=$(jq -r '.outbounds[] | select(.protocol=="socks") | .tag' "$config_json")
+    if [ -z "$outbound_list" ]; then
+        echo "当前没有任何 代理链出站。"
+        return
+    fi
+
+    IFS=$'\n' read -rd '' -a s5_out_array <<< "$outbound_list"
+    echo "------- 代理链出站列表 -------"
+    for i in "${!s5_out_array[@]}"; do
+        echo "$((i+1)). ${s5_out_array[$i]}"
+    done
+    echo "0. 返回上一级"
+    echo "-----------------------------"
+
+    while true; do
+        read -rp "请选择要删除的 代理链出站（数字）： " choice
+        if [ "$choice" = "0" ]; then
+            break
+        fi
+        if ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt "${#s5_out_array[@]}" ]; then
+            echo "无效选项。"
+            continue
+        fi
+
+        local del_tag="${s5_out_array[$((choice-1))]}"
+        # 删除对应 outbound
+        jq --arg del_tag "$del_tag" 'del(.outbounds[] | select(.tag == $del_tag))' "$config_json" > tmp_config.json && mv tmp_config.json "$config_json"
+        # 同时删除与之对应的 routing 规则
+        jq --arg del_tag "$del_tag" 'del(.routing.rules[]? | select(.outboundTag == $del_tag))' "$config_json" > tmp_config.json && mv tmp_config.json "$config_json"
+
+        if ! xray -test -c "$config_json"; then
+            echo "错误：更新后配置无效。"
+            break
+        fi
+
+        # 删除代理链出站后，自动还原 IPv4 优先
+        set_ipv4_priority "true"
+
+        systemctl restart xray
+        echo "代理链出站 [$del_tag] 已删除，并已恢复 IPv4 优先。"
+        break
+    done
+}
+
+############################################
+# 网络优化
+############################################
 optimize_network() {
-    # 备份当前的 sysctl 配置
-    cp /etc/sysctl.conf /etc/sysctl.conf.bak
+    echo "即将进行网络优化，会修改 /etc/sysctl.conf 文件。"
+    read -rp "确认进行？(y/n，默认n)：" choice
+    choice=${choice:-n}
+    if [[ "$choice" =~ ^[Yy]$ ]]; then
+        cp /etc/sysctl.conf /etc/sysctl.conf.bak
+        sed -i '/net\.ipv4\.tcp_no_metrics_save/d' /etc/sysctl.conf
+        sed -i '/net\.ipv4\.tcp_ecn/d' /etc/sysctl.conf
+        sed -i '/net\.ipv4\.tcp_frto/d' /etc/sysctl.conf
+        sed -i '/net\.ipv4\.tcp_mtu_probing/d' /etc/sysctl.conf
+        sed -i '/net\.ipv4\.tcp_rfc1337/d' /etc/sysctl.conf
+        sed -i '/net\.ipv4\.tcp_sack/d' /etc/sysctl.conf
+        sed -i '/net\.ipv4\.tcp_fack/d' /etc/sysctl.conf
+        sed -i '/net\.ipv4\.tcp_window_scaling/d' /etc/sysctl.conf
+        sed -i '/net\.ipv4\.tcp_adv_win_scale/d' /etc/sysctl.conf
+        sed -i '/net\.ipv4\.tcp_moderate_rcvbuf/d' /etc/sysctl.conf
+        sed -i '/net\.ipv4\.tcp_rmem/d' /etc/sysctl.conf
+        sed -i '/net\.ipv4\.tcp_wmem/d' /etc/sysctl.conf
+        sed -i '/net\.core\.rmem_max/d' /etc/sysctl.conf
+        sed -i '/net\.core\.wmem_max/d' /etc/sysctl.conf
+        sed -i '/net\.ipv4\.tcp_notsent_lowat/d' /etc/sysctl.conf
+        sed -i '/net\.ipv4\.udp_rmem_min/d' /etc/sysctl.conf
+        sed -i '/net\.ipv4\.udp_wmem_min/d' /etc/sysctl.conf
+        sed -i '/net\.core\.default_qdisc/d' /etc/sysctl.conf
+        sed -i '/net\.ipv4\.tcp_congestion_control/d' /etc/sysctl.conf
+        sed -i '/net\.ipv4\.tcp_collapse_max_bytes/d' /etc/sysctl.conf
 
-    # 移除已有的优化参数
-    sed -i '/net\.ipv4\.tcp_no_metrics_save/d' /etc/sysctl.conf
-    sed -i '/net\.ipv4\.tcp_ecn/d' /etc/sysctl.conf
-    sed -i '/net\.ipv4\.tcp_frto/d' /etc/sysctl.conf
-    sed -i '/net\.ipv4\.tcp_mtu_probing/d' /etc/sysctl.conf
-    sed -i '/net\.ipv4\.tcp_rfc1337/d' /etc/sysctl.conf
-    sed -i '/net\.ipv4\.tcp_sack/d' /etc/sysctl.conf
-    sed -i '/net\.ipv4\.tcp_fack/d' /etc/sysctl.conf
-    sed -i '/net\.ipv4\.tcp_window_scaling/d' /etc/sysctl.conf
-    sed -i '/net\.ipv4\.tcp_adv_win_scale/d' /etc/sysctl.conf
-    sed -i '/net\.ipv4\.tcp_moderate_rcvbuf/d' /etc/sysctl.conf
-    sed -i '/net\.ipv4\.tcp_rmem/d' /etc/sysctl.conf
-    sed -i '/net\.ipv4\.tcp_wmem/d' /etc/sysctl.conf
-    sed -i '/net\.core\.rmem_max/d' /etc/sysctl.conf
-    sed -i '/net\.core\.wmem_max/d' /etc/sysctl.conf
-    sed -i '/net\.ipv4\.tcp_notsent_lowat/d' /etc/sysctl.conf
-    sed -i '/net\.ipv4\.udp_rmem_min/d' /etc/sysctl.conf
-    sed -i '/net\.ipv4\.udp_wmem_min/d' /etc/sysctl.conf
-    sed -i '/net\.core\.default_qdisc/d' /etc/sysctl.conf
-    sed -i '/net\.ipv4\.tcp_congestion_control/d' /etc/sysctl.conf
-    sed -i '/net\.ipv4\.tcp_collapse_max_bytes/d' /etc/sysctl.conf
-
-    # 添加新的优化参数
-    cat >> /etc/sysctl.conf << EOF
+cat >> /etc/sysctl.conf << EOF
 # 网络优化参数
 net.ipv4.tcp_no_metrics_save=1
 net.ipv4.tcp_ecn=0
@@ -209,585 +628,173 @@ net.ipv4.tcp_notsent_lowat=131072
 net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=bbr
 EOF
-
-    # 使配置生效
-    sysctl -p && sysctl --system
-
-    echo "网络优化已完成。"
+        sysctl -p && sysctl --system
+        echo "网络优化已完成。"
+    else
+        echo "已取消操作。"
+    fi
 }
 
-# 显示代理配置信息
-display_proxy_info() {
-
-
-    echo "服务运行状态："
+############################################
+# 显示配置信息
+############################################
+show_config_info() {
+    echo "---------- Xray 服务状态 ----------"
     systemctl status xray --no-pager
+    echo "----------------------------------"
 
-    echo "正在获取本机 IP 地址..."
+    echo "正在获取本机 IP..."
+    local ipv4 ipv6
     ipv4=$(curl -s4 ip.sb)
     ipv6=$(curl -s6 ip.sb)
+    echo "IPv4: ${ipv4:-"未检测到"}"
+    echo "IPv6: ${ipv6:-"未检测到"}"
 
-    echo "---------------------------------"
-    echo "本机 IPv4 地址： ${ipv4:-"未检测到 IPv4 地址"}"
-    echo "本机 IPv6 地址： ${ipv6:-"未检测到 IPv6 地址"}"
-    echo "---------------------------------"
-
-    if [ -f "$ss_config" ]; then
-        echo "Shadowsocks 配置信息："
-        source "$ss_config"
-        echo "服务端口： $port"
-        echo "密码： $password"
-        echo "加密方式： $method"
-        echo "启用 IPv4 优先： $ipv4_only"
-        echo "---------------------------------"
-    else
-        echo "未检测到 Shadowsocks 配置。"
-    fi
-
-    if [ -f "$socks_config" ]; then
-        echo "SOCKS5 配置信息："
-        source "$socks_config"
-        echo "服务端口： $port"
-        if [ -n "$username" ]; then
-            echo "用户名： $username"
-            echo "密码： $password"
-        else
-            echo "认证： 无需认证"
-        fi
-        echo "启用 IPv4 优先： $ipv4_only"
-        echo "---------------------------------"
-    else
-        echo "未检测到 SOCKS5 配置。"
-    fi
-
+    echo "========== 已配置的 INBOUND 列表 =========="
+    jq -r '.inbounds[] | "tag: \(.tag), protocol: \(.protocol), port: \(.port)"' "$config_json"
+    echo "========== 已配置的 OUTBOUND 列表 ========="
+    jq -r '.outbounds[] | "tag: \(.tag), protocol: \(.protocol)"' "$config_json"
+    echo "=========================================="
 }
 
+############################################
+# 管理 Xray 服务
+############################################
+manage_xray_service() {
+  while true; do
+    echo "---------- 管理 Xray 服务 ----------"
+    echo "1. 设定每天自动重启"
+    echo "2. 立即重启"
+    echo "0. 返回上一级"
+    read -rp "请输入选项: " opt
+    case "$opt" in
+      1)
+        read -rp "请输入每天自动重启的小时（0-23，输入 0 返回）： " hr
+        if [ "$hr" = "0" ]; then
+            continue
+        fi
+        if ! [[ "$hr" =~ ^[0-9]+$ ]] || [ "$hr" -lt 0 ] || [ "$hr" -gt 23 ]; then
+            echo "错误：请输入有效的小时（0-23）。"
+            continue
+        fi
+        (crontab -l 2>/dev/null | grep -v 'systemctl restart xray') | crontab -
+        (crontab -l 2>/dev/null; echo "0 $hr * * * systemctl restart xray") | crontab -
+        echo "已设置每天 $hr 点自动重启 Xray。"
+        ;;
+      2)
+        systemctl restart xray
+        echo "Xray 服务已立即重启。"
+        ;;
+      0)
+        break
+        ;;
+      *)
+        echo "无效选项。"
+        ;;
+    esac
+  done
+}
+
+############################################
+# 卸载 Xray
+############################################
+uninstall_xray() {
+    echo "即将卸载 Xray 并删除所有配置及日志。确定要继续吗？(y/n，默认n)"
+    read -r confirm
+    confirm=${confirm:-n}
+    if [[ ! $confirm =~ ^[Yy]$ ]]; then
+        echo "已取消卸载。"
+        return
+    fi
+
+    systemctl stop xray
+    systemctl disable xray
+    (crontab -l 2>/dev/null | grep -v 'systemctl restart xray') | crontab -
+    rm -rf /usr/local/etc/xray
+    if [ -f /usr/local/bin/xray ]; then
+        rm -f /usr/local/bin/xray
+    fi
+    if [ -f /etc/systemd/system/xray.service ]; then
+        rm -f /etc/systemd/system/xray.service
+        systemctl daemon-reload
+    fi
+    rm -rf /var/log/xray
+    echo "Xray 已全部卸载并删除配置信息。"
+}
+
+############################################
+# 主菜单
+############################################
 exit_script=false
 while [ "$exit_script" = false ]; do
-    # 提示用户选择操作
-    echo "请选择操作："
-    echo "1. 安装 Shadowsocks "
-    echo "2. 修改 Shadowsocks 配置"
-    echo "3. 安装 SOCKS5 "
-    echo "4. 修改 SOCKS5 配置"
-    echo "5. 卸载已安装代理"
-    echo "6. 修改 IPv4 优先设置"
-    echo "7. 进行网络优化"
-    echo "8. 显示代理的配置信息"
+    echo "=============== 主菜单 ==============="
+    echo "1. Shadowsocks 入站管理（添加/删除）"
+    echo "2. Socks5 入站管理（添加/删除）"
+    echo "3. 代理链 出站管理（添加/删除）"  
+    echo "4. 网络优化"
+    echo "5. 显示 Xray 配置信息"
+    echo "6. 管理 Xray 服务"
+    echo "7. 卸载 Xray 并删除所有配置"
     echo "0. 退出"
-    read -rp "请输入选项（0-8）： " action
+    read -rp "请选择操作(0-7)： " main_choice
 
-    case "$action" in
+    case "$main_choice" in
         1)
-            # 安装 Shadowsocks
-            init_config
-
-            # 提示用户输入 Shadowsocks 配置
             while true; do
-                read -rp "请输入 Shadowsocks 服务端口（默认 28001，输入 0 返回上一级）： " port
-                if [ "$port" = "0" ]; then
-                    break
-                fi
-                port=${port:-28001}
-
-                # 验证端口号是否为有效的数字
-                if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -le 0 ] || [ "$port" -gt 65535 ]; then
-                    echo "错误：请输入有效的端口号（1-65535）。"
-                    continue
-                fi
-
-                read -rp "请输入 Shadowsocks 密码（留空生成随机密码，输入 0 返回上一级）： " password
-                if [ "$password" = "0" ]; then
-                    break
-                fi
-                password=${password:-$(generate_password)}
-
-                # 选择加密方式
-                while true; do
-                    echo "请选择 Shadowsocks 加密方式："
-                    for i in "${!supported_methods[@]}"; do
-                        echo "$((i+1)). ${supported_methods[$i]}"
-                    done
-                    echo "0. 返回上一级"
-                    read -rp "请输入选项（0-${#supported_methods[@]}，默认 1）： " method_choice
-                    method_choice=${method_choice:-1}
-                    if [ "$method_choice" = "0" ]; then
-                        break 2
-                    fi
-                    if ! [[ "$method_choice" =~ ^[0-9]+$ ]] || [ "$method_choice" -lt 1 ] || [ "$method_choice" -gt "${#supported_methods[@]}" ]; then
-                        echo "错误：请输入有效的选项。"
-                        continue
-                    fi
-                    method="${supported_methods[$((method_choice-1))]}"
-                    break
-                done
-
-                # 提示用户选择是否启用 IPv4 优先
-                read -rp "是否启用 IPv4 优先进行连接？(y/n，默认 y，输入 0 返回上一级)： " ipv4_choice
-                if [ "$ipv4_choice" = "0" ]; then
-                    break
-                fi
-                ipv4_choice=${ipv4_choice:-y}
-                if [[ "$ipv4_choice" =~ ^[Yy]$ ]]; then
-                    ipv4_setting="true"
-                else
-                    ipv4_setting="false"
-                fi
-
-                # 安装 Xray
-                if ! command -v xray >/dev/null 2>&1; then
-                    echo "正在安装 Xray..."
-                    bash <(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh) install
-                fi
-
-                # 配置 Xray Shadowsocks
-                update_ss_inbound "$port" "$method" "$password"
-                update_outbound_routing "$ipv4_setting"
-
-                # 设置日志目录权限
-                mkdir -p /var/log/xray
-                chown nobody:nogroup /var/log/xray
-
-                # 验证配置文件是否有效
-                if ! xray -test -c "$config_json"; then
-                    echo "错误：Xray 配置文件无效。请检查配置。"
-                    break
-                fi
-
-                # 启动并启用 Xray 服务
-                systemctl restart xray
-                systemctl enable xray
-
-                # 保存用户的配置
-                echo "port=$port" > "$ss_config"
-                echo "password=$password" >> "$ss_config"
-                echo "method=$method" >> "$ss_config"
-                echo "ipv4_only=$ipv4_setting" >> "$ss_config"
-
-                # 显示服务信息
-                echo "Xray Shadowsocks 已成功安装和配置！"
-                echo "---------------------------------"
-                echo "服务端口： $port"
-                echo "密码： $password"
-                echo "加密方式： $method"
-                echo "启用 IPv4 优先： $ipv4_setting"
-                echo "---------------------------------"
-                echo "服务运行状态："
-                systemctl status xray --no-pager
-                break
+                echo "------ Shadowsocks 入站管理 ------"
+                echo "1. 添加 Shadowsocks 入站"
+                echo "2. 删除 Shadowsocks 入站"
+                echo "0. 返回主菜单"
+                read -rp "请选择操作: " ss_action
+                case "$ss_action" in
+                    1) add_shadowsocks_inbound ;;
+                    2) remove_shadowsocks_inbound ;;
+                    0) break ;;
+                    *) echo "无效选项。";;
+                esac
             done
             ;;
         2)
-            # 修改 Shadowsocks 配置
-            if [ ! -f "$ss_config" ]; then
-                echo "错误：未找到 Shadowsocks 配置文件。请先安装 Shadowsocks。"
-                continue
-            fi
-
-            init_config
-            source "$ss_config"
-
             while true; do
-                # 提示用户输入新的配置
-                read -rp "请输入新的 Shadowsocks 服务端口（当前 $port，直接回车保持不变，输入 0 返回上一级）： " new_port
-                if [ "$new_port" = "0" ]; then
-                    break
-                fi
-                new_port=${new_port:-$port}
-
-                # 验证端口号是否为有效的数字
-                if ! [[ "$new_port" =~ ^[0-9]+$ ]] || [ "$new_port" -le 0 ] || [ "$new_port" -gt 65535 ]; then
-                    echo "错误：请输入有效的端口号（1-65535）。"
-                    continue
-                fi
-
-                read -rp "请输入新的 Shadowsocks 密码（直接回车保持不变，输入 0 返回上一级）： " new_password
-                if [ "$new_password" = "0" ]; then
-                    break
-                fi
-                new_password=${new_password:-$password}
-
-                # 选择新的加密方式
-                while true; do
-                    echo "请选择新的 Shadowsocks 加密方式（当前 $method）："
-                    for i in "${!supported_methods[@]}"; do
-                        echo "$((i+1)). ${supported_methods[$i]}"
-                    done
-                    echo "0. 返回上一级"
-                    echo "直接回车保持不变"
-                    read -rp "请输入选项（0-${#supported_methods[@]}）： " method_choice
-                    if [ "$method_choice" = "0" ]; then
-                        break 2
-                    elif [ -z "$method_choice" ]; then
-                        new_method="$method"
-                        break
-                    fi
-                    if ! [[ "$method_choice" =~ ^[0-9]+$ ]] || [ "$method_choice" -lt 1 ] || [ "$method_choice" -gt "${#supported_methods[@]}" ]; then
-                        echo "错误：请输入有效的选项。"
-                        continue
-                    fi
-                    new_method="${supported_methods[$((method_choice-1))]}"
-                    break
-                done
-
-                # 更新 Shadowsocks 配置
-                update_ss_inbound "$new_port" "$new_method" "$new_password"
-
-                # 更新保存的配置
-                echo "port=$new_port" > "$ss_config"
-                echo "password=$new_password" >> "$ss_config"
-                echo "method=$new_method" >> "$ss_config"
-                echo "ipv4_only=$ipv4_only" >> "$ss_config"
-
-                # 验证配置文件是否有效
-                if ! xray -test -c "$config_json"; then
-                    echo "错误：Xray 配置文件无效。请检查配置。"
-                    break
-                fi
-
-                # 重启 Xray 服务
-                systemctl restart xray
-
-                # 显示新的服务信息
-                echo "Shadowsocks 配置已更新！"
-                echo "---------------------------------"
-                echo "服务端口： $new_port"
-                echo "密码： $new_password"
-                echo "加密方式： $new_method"
-                echo "启用 IPv4 优先： $ipv4_only"
-                echo "---------------------------------"
-                echo "服务运行状态："
-                systemctl status xray --no-pager
-                break
+                echo "------ Socks5 入站管理 ------"
+                echo "1. 添加 Socks5 入站"
+                echo "2. 删除 Socks5 入站"
+                echo "0. 返回主菜单"
+                read -rp "请选择操作: " s5_in_action
+                case "$s5_in_action" in
+                    1) add_socks_inbound ;;
+                    2) remove_socks_inbound ;;
+                    0) break ;;
+                    *) echo "无效选项。";;
+                esac
             done
             ;;
         3)
-            # 安装 SOCKS5
-            init_config
-
             while true; do
-                read -rp "请输入 SOCKS5 服务端口（默认 55555，输入 0 返回上一级）： " port
-                if [ "$port" = "0" ]; then
-                    break
-                fi
-                port=${port:-55555}
-
-                # 验证端口号是否为有效的数字
-                if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -le 0 ] || [ "$port" -gt 65535 ]; then
-                    echo "错误：请输入有效的端口号（1-65535）。"
-                    continue
-                fi
-
-                # 提示用户输入用户名和密码
-                read -rp "请输入 SOCKS5 用户名（留空则不设置认证，输入 0 返回上一级）： " username
-                if [ "$username" = "0" ]; then
-                    break
-                fi
-                if [ -n "$username" ]; then
-                    read -rp "请输入 SOCKS5 密码（输入 0 返回上一级）： " password
-                    if [ "$password" = "0" ]; then
-                        break
-                    fi
-                    auth_setting="password"
-                else
-                    auth_setting="noauth"
-                fi
-
-                # 提示用户选择是否启用 IPv4 优先
-                read -rp "是否启用 IPv4 优先进行连接？(y/n，默认 y，输入 0 返回上一级)： " ipv4_choice
-                if [ "$ipv4_choice" = "0" ]; then
-                    break
-                fi
-                ipv4_choice=${ipv4_choice:-y}
-                if [[ "$ipv4_choice" =~ ^[Yy]$ ]]; then
-                    ipv4_setting="true"
-                else
-                    ipv4_setting="false"
-                fi
-
-                # 安装 Xray（如果未安装）
-                if ! command -v xray >/dev/null 2>&1; then
-                    echo "正在安装 Xray..."
-                    bash <(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh) install
-                fi
-
-                # 配置 Xray SOCKS5
-                update_socks_inbound "$port" "$username" "$password" "$auth_setting"
-                update_outbound_routing "$ipv4_setting"
-
-                # 设置日志目录权限
-                mkdir -p /var/log/xray
-                chown nobody:nogroup /var/log/xray
-
-                # 验证配置文件是否有效
-                if ! xray -test -c "$config_json"; then
-                    echo "错误：Xray 配置文件无效。请检查配置。"
-                    break
-                fi
-
-                # 启动并启用 Xray 服务
-                systemctl restart xray
-                systemctl enable xray
-
-                # 保存 SOCKS5 配置
-                echo "port=$port" > "$socks_config"
-                echo "username=$username" >> "$socks_config"
-                echo "password=$password" >> "$socks_config"
-                echo "auth_setting=$auth_setting" >> "$socks_config"
-                echo "ipv4_only=$ipv4_setting" >> "$socks_config"
-
-                # 显示服务信息
-                echo "Xray SOCKS5 已成功安装和配置！"
-                echo "---------------------------------"
-                echo "服务端口： $port"
-                if [ -n "$username" ]; then
-                    echo "用户名： $username"
-                    echo "密码： $password"
-                else
-                    echo "认证： 无需认证"
-                fi
-                echo "启用 IPv4 优先： $ipv4_setting"
-                echo "---------------------------------"
-                echo "服务运行状态："
-                systemctl status xray --no-pager
-                break
+                echo "------ 代理链出站管理 ------"
+                echo "1. 添加 代理链出站"
+                echo "2. 删除 代理链出站"
+                echo "0. 返回主菜单"
+                read -rp "请选择操作: " s5_out_action
+                case "$s5_out_action" in
+                    1) add_socks_outbound ;;
+                    2) remove_socks_outbound ;;
+                    0) break ;;
+                    *) echo "无效选项。" ;;
+                esac
             done
             ;;
         4)
-            # 修改 SOCKS5 配置
-            if [ ! -f "$socks_config" ]; then
-                echo "错误：未找到 SOCKS5 配置文件。请先安装 SOCKS5。"
-                continue
-            fi
-
-            init_config
-            source "$socks_config"
-
-            while true; do
-                # 提示用户输入新的配置
-                read -rp "请输入新的 SOCKS5 服务端口（当前 $port，直接回车保持不变，输入 0 返回上一级）： " new_port
-                if [ "$new_port" = "0" ]; then
-                    break
-                fi
-                new_port=${new_port:-$port}
-
-                # 验证端口号是否为有效的数字
-                if ! [[ "$new_port" =~ ^[0-9]+$ ]] || [ "$new_port" -le 0 ] || [ "$new_port" -gt 65535 ]; then
-                    echo "错误：请输入有效的端口号（1-65535）。"
-                    continue
-                fi
-
-                # 提示用户输入新的用户名和密码
-                read -rp "是否修改 SOCKS5 认证信息？(y/n，默认 n，输入 0 返回上一级)： " modify_auth
-                if [ "$modify_auth" = "0" ]; then
-                    break
-                fi
-                modify_auth=${modify_auth:-n}
-
-                if [[ "$modify_auth" =~ ^[Yy]$ ]]; then
-                    read -rp "请输入新的 SOCKS5 用户名（留空则不设置认证，输入 0 返回上一级）： " new_username
-                    if [ "$new_username" = "0" ]; then
-                        break
-                    fi
-                    if [ -n "$new_username" ]; then
-                        read -rp "请输入新的 SOCKS5 密码（输入 0 返回上一级）： " new_password
-                        if [ "$new_password" = "0" ]; then
-                            break
-                        fi
-                        auth_setting="password"
-                    else
-                        auth_setting="noauth"
-                    fi
-                else
-                    new_username=$username
-                    new_password=$password
-                    auth_setting=$auth_setting
-                fi
-
-                # 更新 SOCKS5 配置
-                update_socks_inbound "$new_port" "$new_username" "$new_password" "$auth_setting"
-
-                # 更新保存的配置
-                echo "port=$new_port" > "$socks_config"
-                echo "username=$new_username" >> "$socks_config"
-                echo "password=$new_password" >> "$socks_config"
-                echo "auth_setting=$auth_setting" >> "$socks_config"
-                echo "ipv4_only=$ipv4_only" >> "$socks_config"
-
-                # 验证配置文件是否有效
-                if ! xray -test -c "$config_json"; then
-                    echo "错误：Xray 配置文件无效。请检查配置。"
-                    break
-                fi
-
-                # 重启 Xray 服务
-                systemctl restart xray
-
-                # 显示新的服务信息
-                echo "SOCKS5 配置已更新！"
-                echo "---------------------------------"
-                echo "服务端口： $new_port"
-                if [ -n "$new_username" ]; then
-                    echo "用户名： $new_username"
-                    echo "密码： $new_password"
-                else
-                    echo "认证： 无需认证"
-                fi
-                echo "启用 IPv4 优先： $ipv4_only"
-                echo "---------------------------------"
-                echo "服务运行状态："
-                systemctl status xray --no-pager
-                break
-            done
+            optimize_network
             ;;
         5)
-            # 卸载代理
-            while true; do
-                installed_proxies=()
-                if [ -f "$ss_config" ]; then
-                    installed_proxies+=("Shadowsocks")
-                fi
-                if [ -f "$socks_config" ]; then
-                    installed_proxies+=("SOCKS5")
-                fi
-
-                if [ ${#installed_proxies[@]} -eq 0 ]; then
-                    echo "未检测到已安装的代理。"
-                    break
-                else
-                    echo "检测到以下已安装的代理："
-                    for i in "${!installed_proxies[@]}"; do
-                        echo "$((i+1)). ${installed_proxies[$i]}"
-                    done
-                    echo "$(( ${#installed_proxies[@]} + 1 )). 全部卸载"
-                    echo "0. 返回上一级"
-                    read -rp "请输入要卸载的代理编号： " uninstall_choice
-
-                    if [ "$uninstall_choice" = "0" ]; then
-                        break
-                    fi
-
-                    if [ "$uninstall_choice" -ge 1 ] && [ "$uninstall_choice" -le "${#installed_proxies[@]}" ]; then
-                        proxy_to_uninstall="${installed_proxies[$((uninstall_choice - 1))]}"
-                        if [ "$proxy_to_uninstall" == "Shadowsocks" ]; then
-                            # 卸载 Shadowsocks
-                            jq 'del(.inbounds[] | select(.protocol == "shadowsocks"))' "$config_json" > tmp_config.json && mv tmp_config.json "$config_json"
-                            rm -f "$ss_config"
-                            echo "Shadowsocks 已成功卸载！"
-                        elif [ "$proxy_to_uninstall" == "SOCKS5" ]; then
-                            # 卸载 SOCKS5
-                            jq 'del(.inbounds[] | select(.protocol == "socks"))' "$config_json" > tmp_config.json && mv tmp_config.json "$config_json"
-                            rm -f "$socks_config"
-                            echo "SOCKS5 已成功卸载！"
-                        fi
-                    elif [ "$uninstall_choice" -eq "$(( ${#installed_proxies[@]} + 1 ))" ]; then
-                        # 卸载所有代理
-                        jq 'del(.inbounds[] | select(.protocol == "shadowsocks" or .protocol == "socks"))' "$config_json" > tmp_config.json && mv tmp_config.json "$config_json"
-                        rm -f "$ss_config" "$socks_config"
-                        echo "所有代理已成功卸载！"
-                    else
-                        echo "无效的选项。"
-                        continue
-                    fi
-
-                    # 验证配置文件是否有效
-                    if ! xray -test -c "$config_json"; then
-                        echo "错误：Xray 配置文件无效。请检查配置。"
-                        break
-                    fi
-
-                    # 重启 Xray 服务
-                    systemctl restart xray
-
-                    echo "代理卸载完成。"
-                    break
-                fi
-            done
+            show_config_info
             ;;
         6)
-            # 修改 IPv4 优先设置
-            if [ ! -f "$config_json" ]; then
-                echo "错误：未找到 Xray 配置文件。请先安装 Shadowsocks 或 SOCKS5。"
-                continue
-            fi
-
-            while true; do
-                ipv4_only=$(jq -r '.outbounds[0].settings.domainStrategy // empty' "$config_json")
-                if [ "$ipv4_only" == "UseIPv4" ]; then
-                    current_choice="开启"
-                else
-                    current_choice="关闭"
-                fi
-
-                echo "当前 IPv4 优先设置：$current_choice"
-                echo "请选择新的 IPv4 优先设置："
-                echo "1. 开启 IPv4 优先"
-                echo "2. 关闭 IPv4 优先"
-                echo "0. 返回上一级"
-                read -rp "请输入选项（0-2）： " ipv4_option
-
-                if [ "$ipv4_option" = "0" ]; then
-                    break
-                fi
-
-                if [ "$ipv4_option" == "1" ]; then
-                    ipv4_setting="true"
-                    new_choice="开启"
-                elif [ "$ipv4_option" == "2" ]; then
-                    ipv4_setting="false"
-                    new_choice="关闭"
-                else
-                    echo "无效的选项。"
-                    continue
-                fi
-
-                # 更新出站和路由配置
-                update_outbound_routing "$ipv4_setting"
-
-                # 更新保存的配置（如果有）
-                if [ -f "$ss_config" ]; then
-                    sed -i 's/ipv4_only=\(true\|false\)/ipv4_only='"$ipv4_setting"'/' "$ss_config"
-                fi
-                if [ -f "$socks_config" ]; then
-                    sed -i 's/ipv4_only=\(true\|false\)/ipv4_only='"$ipv4_setting"'/' "$socks_config"
-                fi
-
-                # 验证配置文件是否有效
-                if ! xray -test -c "$config_json"; then
-                    echo "错误：Xray 配置文件无效。请检查配置。"
-                    break
-                fi
-
-                # 重启 Xray 服务
-                systemctl restart xray
-
-                echo "IPv4 优先设置已修改为：$new_choice"
-                echo "服务运行状态："
-                systemctl status xray --no-pager
-                break
-            done
+            manage_xray_service
             ;;
         7)
-            # 进行网络优化
-            while true; do
-                echo "即将进行网络优化，此操作会修改 /etc/sysctl.conf 文件。"
-                echo "1. 确认进行网络优化"
-                echo "0. 返回上一级"
-                read -rp "请输入选项（0-1）： " optimize_choice
-
-                if [ "$optimize_choice" = "0" ]; then
-                    break
-                elif [ "$optimize_choice" = "1" ]; then
-                    optimize_network
-                    break
-                else
-                    echo "无效的选项。"
-                fi
-            done
-            ;;
-        8)
-            # 显示已安装代理的配置信息
-            display_proxy_info
+            uninstall_xray
             ;;
         0)
             echo "退出脚本。"
