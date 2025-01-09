@@ -21,10 +21,17 @@ DISTRO=""
 LANGUAGE=${LANG:-"zh"} # 支持通过环境变量设置语言
 
 # 颜色定义
-GREEN='\033[0;32m'
-RED='\033[0;31m'
-YELLOW='\033[1;33m'
-NC='\033[0m' # No Color
+if [[ -t 1 ]]; then
+    GREEN='\033[0;32m'
+    RED='\033[0;31m'
+    YELLOW='\033[1;33m'
+    NC='\033[0m' # No Color
+else
+    GREEN=''
+    RED=''
+    YELLOW=''
+    NC=''
+fi
 
 # 日志函数
 log() {
@@ -59,17 +66,17 @@ detect_distro() {
 
 # 安装依赖
 install_dependencies() {
-    log "安装依赖：jq, curl..."
+    log "安装依赖：jq, curl, iproute2..."
     case "$DISTRO" in
         ubuntu|debian)
-            apt-get update && apt-get install -y jq curl
+            apt-get update && apt-get install -y jq curl iproute2
             ;;
         centos|rhel)
             yum install -y epel-release
-            yum install -y jq curl
+            yum install -y jq curl iproute
             ;;
         arch)
-            pacman -Sy --noconfirm jq curl
+            pacman -Sy --noconfirm jq curl iproute2
             ;;
         *)
             log "${RED}错误:${NC} 不支持的发行版：$DISTRO"
@@ -192,14 +199,16 @@ restart_xray() {
 
 # 备份配置
 backup_config() {
-    cp "$CONFIG_JSON" "${CONFIG_JSON}.bak_$(date +%s)"
-    log "已备份当前配置到 ${CONFIG_JSON}.bak_$(date +%s)}"
+    local timestamp
+    timestamp=$(date '+%Y%m%d_%H%M%S')
+    cp "$CONFIG_JSON" "${CONFIG_JSON}.bak_${timestamp}"
+    log "已备份当前配置到 ${CONFIG_JSON}.bak_${timestamp}"
 }
 
 # 恢复配置
 restore_config() {
     local backup_file
-    backup_file=$(ls "${CONFIG_JSON}.bak_"* | sort | tail -n1)
+    backup_file=$(ls "${CONFIG_JSON}.bak_"* 2>/dev/null | sort | tail -n1)
     if [[ -f "$backup_file" ]]; then
         cp "$backup_file" "$CONFIG_JSON"
         log "已从备份恢复配置：$backup_file"
@@ -227,13 +236,26 @@ add_inbound() {
                 "destOverride": ["http","tls"]
             }
         }]
-    ' <<< "$CONFIG_CONTENT" > "$TMP_CONFIG" && mv "$TMP_CONFIG" "$CONFIG_JSON"
+    ' "$CONFIG_JSON" > "$TMP_CONFIG" && mv "$TMP_CONFIG" "$CONFIG_JSON"
 }
 
 # 通用删除 inbound 函数
 remove_inbound() {
     local tag=$1
     jq --arg tag "$tag" 'del(.inbounds[] | select(.tag == $tag))' "$CONFIG_JSON" > "$TMP_CONFIG" && mv "$TMP_CONFIG" "$CONFIG_JSON"
+}
+
+# 自动选择可用端口
+find_available_port() {
+    local start_port=$1
+    local end_port=$2
+    for (( port=start_port; port<=end_port; port++ )); do
+        if ! port_conflict_check "$port" && ! ss -lnt | grep -qw ":$port "; then
+            echo "$port"
+            return
+        fi
+    done
+    echo ""
 }
 
 # Shadowsocks 入站管理
@@ -451,6 +473,7 @@ add_socks_inbound() {
             }]
         ' "$CONFIG_JSON" > "$TMP_CONFIG" && mv "$TMP_CONFIG" "$CONFIG_JSON"
 
+        # 读取更新后的配置
         CONFIG_CONTENT=$(<"$CONFIG_JSON")
 
         if ! validate_config; then
@@ -578,6 +601,7 @@ add_socks_outbound() {
             ' "$CONFIG_JSON" > "$TMP_CONFIG" && mv "$TMP_CONFIG" "$CONFIG_JSON"
         fi
 
+        # 读取更新后的配置
         CONFIG_CONTENT=$(<"$CONFIG_JSON")
 
         # 选择要路由的 inbound
@@ -631,6 +655,7 @@ add_socks_outbound() {
             fi
         fi
 
+        # 读取更新后的配置
         CONFIG_CONTENT=$(<"$CONFIG_JSON")
 
         if ! validate_config; then
@@ -684,6 +709,7 @@ remove_socks_outbound() {
         # 还原 IPv4 优先
         set_ipv4_priority "true"
 
+        # 读取更新后的配置
         CONFIG_CONTENT=$(<"$CONFIG_JSON")
 
         if ! validate_config; then
@@ -704,8 +730,10 @@ optimize_network() {
     choice=${choice:-n}
     if [[ "$choice" =~ ^[Yy]$ ]]; then
         backup_config
-        cp /etc/sysctl.conf /etc/sysctl.conf.bak_$(date +%s)
-        log "已备份 /etc/sysctl.conf 至 /etc/sysctl.conf.bak_$(date +%s)。"
+        local timestamp
+        timestamp=$(date '+%Y%m%d_%H%M%S')
+        cp /etc/sysctl.conf /etc/sysctl.conf.bak_${timestamp}
+        log "已备份 /etc/sysctl.conf 至 /etc/sysctl.conf.bak_${timestamp}。"
 
         # 定义优化参数
         read -r -d '' sysctl_params <<EOF
@@ -822,19 +850,6 @@ uninstall_xray() {
     systemctl daemon-reload || true
     rm -rf /var/log/xray
     log "Xray 已全部卸载并删除配置信息。"
-}
-
-# 自动选择可用端口
-find_available_port() {
-    local start_port=$1
-    local end_port=$2
-    for (( port=start_port; port<=end_port; port++ )); do
-        if ! port_conflict_check "$port" && ! ss -lnt | grep -qw ":$port "; then
-            echo "$port"
-            return
-        fi
-    done
-    echo ""
 }
 
 # 主菜单
