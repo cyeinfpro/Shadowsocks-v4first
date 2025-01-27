@@ -1,7 +1,7 @@
 #!/bin/bash
 
 #=====================================================
-#   Xray 多入站、多出站管理脚本（含卸载 Xray 选项）
+#   Xray 多入站、多出站管理脚本
 #   - Shadowsocks 默认端口 28001, Socks5 入站默认 55555
 #   - 添加入站时检查端口冲突
 #   - 添加入站时可选 IPv4 优先
@@ -364,7 +364,7 @@ add_shadowsocks_inbound() {
     local supported_methods=("aes-256-gcm" "aes-128-gcm" "chacha20-ietf-poly1305" "xchacha20-ietf-poly1305" "2022-blake3-aes-256-gcm" "2022-blake3-chacha20-poly1305" "aes-256-cfb" "aes-128-cfb" "aes-256-ctr" "rc4-md5")
 
     while true; do
-        echo -e "\n${YELLOW}提示:${NC} 若直接回车，则使用脚本内自动分配端口(20000~30000)。\n若想使用脚本注释所说的"默认 28001"，请手动输入 28001。"
+        echo -e "\n${YELLOW}提示:${NC} 若直接回车，则使用默认端口 28001。"
         read -rp "请输入 Shadowsocks 入站端口（输入 0 返回上一级）： " port_input
         if [[ "$port_input" == "0" ]]; then
             return
@@ -372,12 +372,8 @@ add_shadowsocks_inbound() {
 
         local port
         if [[ -z "$port_input" ]]; then
-            port=$(find_available_port 20000 30000)
-            if [[ -z "$port" ]]; then
-                log "${RED}错误:${NC} 未找到可用端口，请手动输入。"
-                continue
-            fi
-            log "自动分配端口：$port"
+            port=28001
+            log "使用默认端口：$port"
         else
             port="$port_input"
             if ! [[ "$port" =~ ^[0-9]+$ ]] || (( port <= 0 || port > 65535 )); then
@@ -503,7 +499,7 @@ remove_shadowsocks_inbound() {
 # Socks5 入站管理
 add_socks_inbound() {
     while true; do
-        echo -e "\n${YELLOW}提示:${NC} 若直接回车则自动分配端口(30000~40000)。如需 55555，可手动输入。"
+        echo -e "\n${YELLOW}提示:${NC} 若直接回车，则使用默认端口 55555。"
         read -rp "请输入 Socks5 入站端口（输入 0 返回上一级）： " port_input
         if [[ "$port_input" == "0" ]]; then
             return
@@ -511,12 +507,8 @@ add_socks_inbound() {
 
         local port
         if [[ -z "$port_input" ]]; then
-            port=$(find_available_port 30000 40000)
-            if [[ -z "$port" ]]; then
-                log "${RED}错误:${NC} 未找到可用端口，请手动输入。"
-                continue
-            fi
-            log "自动分配端口：$port"
+            port=55555
+            log "使用默认端口：$port"
         else
             port="$port_input"
             if ! [[ "$port" =~ ^[0-9]+$ ]] || (( port <= 0 || port > 65535 )); then
@@ -537,31 +529,31 @@ add_socks_inbound() {
             set_ipv4_priority "false"
         fi
 
-        local inbound_tag="socks-inbound-$port"
         read -rp "是否需要用户名密码认证？(y/n，默认 n)： " auth_choice
         auth_choice=${auth_choice:-n}
-
-        local auth_config
+        local auth_settings='{}'
         if [[ "$auth_choice" =~ ^[Yy]$ ]]; then
-            read -rp "请输入用户名：" s5_user
-            read -srp "请输入密码：" s5_pass
+            read -rp "请输入用户名：" username
+            read -srp "请输入密码：" password
             echo
-            auth_config=$(jq -n --arg user "$s5_user" --arg pass "$s5_pass" '
+            auth_settings=$(jq -n --arg user "$username" --arg pass "$password" '
                 {
                     "auth": "password",
-                    "accounts": [{ "user": $user, "pass": $pass }],
-                    "udp": true
+                    "accounts": [{
+                        "user": $user,
+                        "pass": $pass
+                    }]
                 }
             ')
-        else
-            auth_config='{"auth":"noauth","udp":true}'
         fi
+
+        local inbound_tag="socks-inbound-$port"
 
         # 备份配置
         backup_config
 
         # 添加入站
-        jq --arg inbound_tag "$inbound_tag" --argjson port "$port" --argjson auth_settings "$auth_config" '
+        jq --argjson port "$port" --arg inbound_tag "$inbound_tag" --argjson auth_settings "$auth_settings" '
             .inbounds += [{
                 "tag": $inbound_tag,
                 "port": $port,
