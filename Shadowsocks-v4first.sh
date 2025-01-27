@@ -10,7 +10,9 @@
 #   - 在删除各项时，列出现有资源供用户选择数字，而非手动输入 tag
 #=====================================================
 
-set -euo pipefail
+# set -euo pipefail 会让脚本在管道和未定义变量等情况下立即退出
+# 为保证在 xray test 失败时能进行后续操作（如还原配置），此处改用 saferun 函数处理
+set -u
 IFS=$'\n\t'
 
 # 全局变量
@@ -18,7 +20,8 @@ CONFIG_JSON="/usr/local/etc/xray/config.json"
 TMP_CONFIG=$(mktemp)
 LOG_FILE="/var/log/xray_manager.log"
 DISTRO=""
-LANGUAGE=${LANG:-"zh"} # 支持通过环境变量设置语言
+#LANGUAGE=${LANG:-"zh"} # 原脚本未使用，故先注释
+#COLORFUL_OUTPUT=false  # 如需多语言、可自己扩展
 
 # 颜色定义
 if [[ -t 1 ]]; then
@@ -33,10 +36,28 @@ else
     NC=''
 fi
 
+# 封装运行命令，方便在出错时不直接退出
+saferun() {
+    "$@"
+    local status=$?
+    return $status
+}
+
 # 日志函数
 log() {
     local message="$1"
-    echo -e "$(date '+%Y-%m-%d %H:%M:%S') $message" | tee -a "$LOG_FILE"
+    local log_level="${2:-INFO}"
+    echo -e "$(date '+%Y-%m-%d %H:%M:%S') [$log_level] $message" | tee -a "$LOG_FILE"
+    
+    # 日志轮转（最大10MB）
+    local log_size=0
+    if command -v stat >/dev/null 2>&1; then
+        log_size=$(stat -c%s "$LOG_FILE" 2>/dev/null || echo 0)
+    fi
+    if (( log_size > 10485760 )); then
+        mv "$LOG_FILE" "${LOG_FILE}.1"
+        log "日志文件已轮转" "INFO"
+    fi
 }
 
 # 清理临时文件
@@ -64,19 +85,26 @@ detect_distro() {
     log "检测到的发行版：$DISTRO"
 }
 
+# 检测是否 systemd
+check_systemd() {
+    if ! pidof systemd >/dev/null 2>&1; then
+        log "${YELLOW}警告:${NC} 当前系统可能不使用 systemd，后续涉及 systemctl 的操作可能失败。" "WARNING"
+    fi
+}
+
 # 安装依赖
 install_dependencies() {
-    log "安装依赖：jq, curl, iproute2..."
+    log "安装依赖：jq, curl, iproute2, moreutils..."
     case "$DISTRO" in
         ubuntu|debian)
-            apt-get update && apt-get install -y jq curl iproute2
+            apt-get update && apt-get install -y jq curl iproute2 moreutils
             ;;
         centos|rhel)
             yum install -y epel-release
-            yum install -y jq curl iproute
+            yum install -y jq curl iproute moreutils
             ;;
         arch)
-            pacman -Sy --noconfirm jq curl iproute2
+            pacman -Sy --noconfirm jq curl iproute2 moreutils
             ;;
         *)
             log "${RED}错误:${NC} 不支持的发行版：$DISTRO"
@@ -87,7 +115,7 @@ install_dependencies() {
 
 # 生成随机密码
 generate_password() {
-    tr -dc 'A-Za-z0-9' </dev/urandom | head -c 16
+    tr -dc 'A-Za-z0-9!@#$%^&*()_+-=' </dev/urandom | head -c 16
 }
 
 # 初始化 config.json
@@ -114,6 +142,15 @@ init_config() {
 EOF
         secure_config
     fi
+
+    # 确保日志目录和文件权限正确
+    mkdir -p /var/log/xray
+    chown -R root:root /var/log/xray
+    chmod -R 755 /var/log/xray
+    touch /var/log/xray/access.log /var/log/xray/error.log
+    chown root:root /var/log/xray/access.log /var/log/xray/error.log
+    chmod 644 /var/log/xray/access.log /var/log/xray/error.log
+    log "已设置日志目录和文件权限。"
 }
 
 # 设置配置文件权限
@@ -127,23 +164,50 @@ secure_config() {
 install_xray_if_needed() {
     if ! command -v xray >/dev/null 2>&1; then
         log "安装 Xray..."
+        # 官方脚本
         bash <(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh) install
-        systemctl enable xray
+        systemctl enable xray 2>/dev/null || true
+
+        # 确保服务文件中的用户为 root
+        local service_file="/etc/systemd/system/xray.service"
+        if [[ -f "$service_file" ]]; then
+            sed -i 's/^User=nobody$/User=root/' "$service_file"
+            systemctl daemon-reload
+            log "已将 Xray 服务文件中的用户修改为 root。"
+        else
+            log "${YELLOW}警告:${NC} 未找到 Xray 服务文件，无法修改用户设置。" "WARNING"
+        fi
+
         log "Xray 安装完成。"
     else
         log "Xray 已安装。"
     fi
 }
 
-# 检测端口是否冲突
+# port_conflict_check：返回 0 表示"端口已冲突"，返回 1 表示"端口可用"
 port_conflict_check() {
     local port=$1
-    jq -r '.inbounds[].port // empty' "$CONFIG_JSON" | grep -qw "$port"
+    # 系统级检测
+    if ss -tuln | grep -qE "[^0-9:]${port}\>"; then
+        return 0
+    fi
+    # 配置检测
+    if jq -e --argjson port "$port" '.inbounds[]? | select(.port == $port)' "$CONFIG_JSON" >/dev/null; then
+        return 0
+    fi
+    # 保留端口检测（此处仅示例列了一些常见端口，可自行扩展）
+    local reserved_ports=(53 67 68 69 80 443 1080 5353 8080)
+    if [[ " ${reserved_ports[*]} " =~ " ${port} " ]]; then
+        log "${YELLOW}警告: 端口 ${port} 是常用服务端口，建议更换${NC}" "WARNING"
+        # 这里不直接return 0，给用户二次选择机会，可自行决定
+    fi
+    return 1
 }
 
 # 设置或重置 IPv4 优先
 set_ipv4_priority() {
     local enable_ipv4="$1"
+    # 这里通过临时文件写回
     if [[ "$enable_ipv4" == "true" ]]; then
         jq '.outbounds = [
             {
@@ -156,7 +220,7 @@ set_ipv4_priority() {
                 "protocol": "freedom",
                 "settings": { "domainStrategy": "UseIPv6" }
             }
-        ]' "$CONFIG_JSON" > "$TMP_CONFIG" && mv "$TMP_CONFIG" "$CONFIG_JSON"
+        ]' "$CONFIG_JSON" | sponge "$CONFIG_JSON"
 
         jq '.routing = {
             "domainStrategy":"IPIfNonMatch",
@@ -172,29 +236,58 @@ set_ipv4_priority() {
                     "outboundTag":"IP6"
                 }
             ]
-        }' "$CONFIG_JSON" > "$TMP_CONFIG" && mv "$TMP_CONFIG" "$CONFIG_JSON"
+        }' "$CONFIG_JSON" | sponge "$CONFIG_JSON"
 
         log "已启用 IPv4 优先。"
     else
-        jq '.outbounds = [{"protocol":"freedom","settings":{}}] | del(.routing)' "$CONFIG_JSON" > "$TMP_CONFIG" && mv "$TMP_CONFIG" "$CONFIG_JSON"
+        jq '.outbounds = [{"protocol":"freedom","settings":{}}]' "$CONFIG_JSON" | sponge "$CONFIG_JSON"
+        # 删除 routing.rules 中 outboundTag == IP4 or IP6 的规则
+        jq 'if .routing.rules then .routing.rules |= map(select(.outboundTag != "IP4" and .outboundTag != "IP6")) else . end' \
+          "$CONFIG_JSON" | sponge "$CONFIG_JSON"
+
         log "已禁用 IPv4 优先。"
     fi
 }
 
-# 验证 Xray 配置
+# 配置验证
 validate_config() {
-    if ! xray -test -c "$CONFIG_JSON"; then
-        log "${RED}错误:${NC} Xray 配置文件无效。"
-        restore_config
-        return 1
+    # 使用 xray run -test 替代 xray test
+    if ! saferun xray run -test -config "$CONFIG_JSON"; then
+        log "配置验证失败，尝试删除空端口/空协议的 inbound/outbound" "WARNING"
+        # 自动修复常见错误
+        jq 'del(.inbounds[]? | select(.port == null))' "$CONFIG_JSON" | sponge "$CONFIG_JSON"
+        jq 'del(.outbounds[]? | select(.protocol == null))' "$CONFIG_JSON" | sponge "$CONFIG_JSON"
+        
+        # 再测一次
+        if ! saferun xray run -test -config "$CONFIG_JSON"; then
+            log "配置验证再次失败，恢复备份" "ERROR"
+            restore_config
+            return 1
+        fi
     fi
+    log "配置验证通过" "SUCCESS"
     return 0
 }
 
 # 重启 Xray
 restart_xray() {
-    systemctl restart xray
-    log "已重启 Xray 服务。"
+    # 确保日志目录和文件权限正确
+    mkdir -p /var/log/xray
+    chown -R root:root /var/log/xray
+    chmod -R 755 /var/log/xray
+    touch /var/log/xray/access.log /var/log/xray/error.log
+    chown root:root /var/log/xray/access.log /var/log/xray/error.log
+    chmod 644 /var/log/xray/access.log /var/log/xray/error.log
+
+    if saferun systemctl restart xray; then
+        sleep 1
+        if systemctl is-active --quiet xray; then
+            log "Xray 服务重启成功。"
+            return 0
+        fi
+    fi
+    log "${RED}错误:${NC} Xray 服务重启失败，请检查日志。" "ERROR"
+    return 1
 }
 
 # 备份配置
@@ -203,14 +296,19 @@ backup_config() {
     timestamp=$(date '+%Y%m%d_%H%M%S')
     cp "$CONFIG_JSON" "${CONFIG_JSON}.bak_${timestamp}"
     log "已备份当前配置到 ${CONFIG_JSON}.bak_${timestamp}"
+    
+    # 保留最近5个备份
+    ls -t "${CONFIG_JSON}.bak_"* 2>/dev/null | tail -n +6 | xargs -r rm -f --
 }
 
 # 恢复配置
 restore_config() {
     local backup_file
-    backup_file=$(ls "${CONFIG_JSON}.bak_"* 2>/dev/null | sort | tail -n1)
+    # 与备份操作保持一致，使用 -t 按时间倒序
+    backup_file=$(ls -t "${CONFIG_JSON}.bak_"* 2>/dev/null | head -n1)
     if [[ -f "$backup_file" ]]; then
         cp "$backup_file" "$CONFIG_JSON"
+        secure_config
         log "已从备份恢复配置：$backup_file"
     else
         log "${RED}错误:${NC} 未找到可用的备份文件，无法恢复。"
@@ -224,25 +322,25 @@ add_inbound() {
     local tag=$3
     local settings=$4
 
-    jq --arg inbound_tag "$tag" --argjson port "$port" --argjson settings "$settings" '
+    jq --arg inbound_tag "$tag" --argjson port "$port" --arg protocol "$protocol" --argjson st "$settings" '
         .inbounds += [{
             "tag": $inbound_tag,
             "port": $port,
             "listen": "0.0.0.0",
             "protocol": $protocol,
-            "settings": $settings,
+            "settings": $st,
             "sniffing": {
                 "enabled": true,
                 "destOverride": ["http","tls"]
             }
         }]
-    ' "$CONFIG_JSON" > "$TMP_CONFIG" && mv "$TMP_CONFIG" "$CONFIG_JSON"
+    ' "$CONFIG_JSON" | sponge "$CONFIG_JSON"
 }
 
 # 通用删除 inbound 函数
 remove_inbound() {
     local tag=$1
-    jq --arg tag "$tag" 'del(.inbounds[] | select(.tag == $tag))' "$CONFIG_JSON" > "$TMP_CONFIG" && mv "$TMP_CONFIG" "$CONFIG_JSON"
+    jq --arg tag "$tag" 'del(.inbounds[] | select(.tag == $tag))' "$CONFIG_JSON" | sponge "$CONFIG_JSON"
 }
 
 # 自动选择可用端口
@@ -250,9 +348,12 @@ find_available_port() {
     local start_port=$1
     local end_port=$2
     for (( port=start_port; port<=end_port; port++ )); do
-        if ! port_conflict_check "$port" && ! ss -lnt | grep -qw ":$port "; then
-            echo "$port"
-            return
+        if ! port_conflict_check "$port"; then
+            # double-check
+            if ! ss -lnt | grep -qw ":$port "; then
+                echo "$port"
+                return 0
+            fi
         fi
     done
     echo ""
@@ -263,10 +364,13 @@ add_shadowsocks_inbound() {
     local supported_methods=("aes-256-gcm" "aes-128-gcm" "chacha20-ietf-poly1305" "xchacha20-ietf-poly1305" "2022-blake3-aes-256-gcm" "2022-blake3-chacha20-poly1305" "aes-256-cfb" "aes-128-cfb" "aes-256-ctr" "rc4-md5")
 
     while true; do
-        read -rp "请输入 Shadowsocks 入站端口（默认 28001，输入 0 返回上一级）： " port_input
+        echo -e "\n${YELLOW}提示:${NC} 若直接回车，则使用脚本内自动分配端口(20000~30000)。\n若想使用脚本注释所说的"默认 28001"，请手动输入 28001。"
+        read -rp "请输入 Shadowsocks 入站端口（输入 0 返回上一级）： " port_input
         if [[ "$port_input" == "0" ]]; then
             return
         fi
+
+        local port
         if [[ -z "$port_input" ]]; then
             port=$(find_available_port 20000 30000)
             if [[ -z "$port" ]]; then
@@ -281,7 +385,7 @@ add_shadowsocks_inbound() {
                 continue
             fi
             if port_conflict_check "$port"; then
-                log "${RED}错误:${NC} 端口冲突！当前Xray已使用端口$port。"
+                log "${RED}错误:${NC} 端口冲突！Xray或系统已使用端口$port。"
                 continue
             fi
         fi
@@ -323,8 +427,9 @@ add_shadowsocks_inbound() {
 
         local inbound_tag="ss-inbound-$port"
 
-        # 准备设置
+        # 准备settings
         local settings
+        # 生成 Shadowsocks inbound 对应的 settings JSON
         settings=$(jq -n --arg method "$method" --arg password "$password" '
             {
                 "method": $method,
@@ -339,16 +444,13 @@ add_shadowsocks_inbound() {
         # 添加入站
         add_inbound "shadowsocks" "$port" "$inbound_tag" "$settings"
 
-        # 读取更新后的配置
-        CONFIG_CONTENT=$(<"$CONFIG_JSON")
-
         if ! validate_config; then
             log "${RED}错误:${NC} 配置验证失败，已恢复备份。"
             return
         fi
 
         restart_xray
-        log "已添加 Shadowsocks 入站：port=$port, password=***, method=$method, tag=$inbound_tag"
+        log "已添加 Shadowsocks 入站：port=$port, password=$password, method=$method, tag=$inbound_tag"
         return
     done
 }
@@ -387,9 +489,6 @@ remove_shadowsocks_inbound() {
         # 删除入站
         remove_inbound "$del_tag"
 
-        # 读取更新后的配置
-        CONFIG_CONTENT=$(<"$CONFIG_JSON")
-
         if ! validate_config; then
             log "${RED}错误:${NC} 配置验证失败，已恢复备份。"
             return
@@ -404,10 +503,13 @@ remove_shadowsocks_inbound() {
 # Socks5 入站管理
 add_socks_inbound() {
     while true; do
-        read -rp "请输入 Socks5 入站端口（默认 55555，输入 0 返回）： " port_input
+        echo -e "\n${YELLOW}提示:${NC} 若直接回车则自动分配端口(30000~40000)。如需 55555，可手动输入。"
+        read -rp "请输入 Socks5 入站端口（输入 0 返回上一级）： " port_input
         if [[ "$port_input" == "0" ]]; then
             return
         fi
+
+        local port
         if [[ -z "$port_input" ]]; then
             port=$(find_available_port 30000 40000)
             if [[ -z "$port" ]]; then
@@ -422,7 +524,7 @@ add_socks_inbound() {
                 continue
             fi
             if port_conflict_check "$port"; then
-                log "${RED}错误:${NC} 端口冲突！当前Xray已使用端口$port。"
+                log "${RED}错误:${NC} 端口冲突！Xray或系统已使用端口$port。"
                 continue
             fi
         fi
@@ -471,10 +573,7 @@ add_socks_inbound() {
                     "destOverride": ["http","tls"]
                 }
             }]
-        ' "$CONFIG_JSON" > "$TMP_CONFIG" && mv "$TMP_CONFIG" "$CONFIG_JSON"
-
-        # 读取更新后的配置
-        CONFIG_CONTENT=$(<"$CONFIG_JSON")
+        ' "$CONFIG_JSON" | sponge "$CONFIG_JSON"
 
         if ! validate_config; then
             log "${RED}错误:${NC} 配置验证失败，已恢复备份。"
@@ -488,23 +587,25 @@ add_socks_inbound() {
 }
 
 remove_socks_inbound() {
-    local s5_inbounds
-    s5_inbounds=$(jq -r '.inbounds[] | select(.protocol=="socks") | .tag' "$CONFIG_JSON")
-
-    if [[ -z "$s5_inbounds" ]]; then
-        log "当前没有任何 Socks5 入站。"
-        return
-    fi
-
-    IFS=$'\n' read -rd '' -a s5_array <<< "$s5_inbounds"
-    echo "---------- Socks5 入站列表 ----------"
-    for i in "${!s5_array[@]}"; do
-        echo "$((i+1)). ${s5_array[$i]}"
-    done
-    echo "0. 返回上一级"
-    echo "-------------------------------------"
-
     while true; do
+        local s5_inbounds
+        s5_inbounds=$(jq -r '.inbounds[] | select(.protocol=="socks") | .tag' "$CONFIG_JSON")
+
+        if [[ -z "$s5_inbounds" ]]; then
+            log "当前没有任何 Socks5 入站。"
+            echo "按任意键返回上一级..."
+            read -n 1 -s
+            return
+        fi
+
+        IFS=$'\n' read -rd '' -a s5_array <<< "$s5_inbounds"
+        echo "---------- Socks5 入站列表 ----------"
+        for i in "${!s5_array[@]}"; do
+            echo "$((i+1)). ${s5_array[$i]}"
+        done
+        echo "0. 返回上一级"
+        echo "-------------------------------------"
+
         read -rp "请选择要删除的 Socks5 入站（数字）： " choice
         if [[ "$choice" == "0" ]]; then
             return
@@ -521,17 +622,16 @@ remove_socks_inbound() {
         # 删除入站
         remove_inbound "$del_tag"
 
-        # 读取更新后的配置
-        CONFIG_CONTENT=$(<"$CONFIG_JSON")
-
         if ! validate_config; then
             log "${RED}错误:${NC} 配置验证失败，已恢复备份。"
-            return
+            continue
         fi
 
         restart_xray
         log "Socks5 入站 [$del_tag] 已删除。"
-        return
+        
+        echo "删除完成，按任意键继续..."
+        read -n 1 -s
     done
 }
 
@@ -585,7 +685,7 @@ add_socks_outbound() {
                         }]
                     }
                 }]
-            ' "$CONFIG_JSON" > "$TMP_CONFIG" && mv "$TMP_CONFIG" "$CONFIG_JSON"
+            ' "$CONFIG_JSON" | sponge "$CONFIG_JSON"
         else
             jq --arg out_tag "$out_tag" --arg s5_addr "$s5_addr" --argjson s5_port "$s5_port" '
                 .outbounds += [{
@@ -598,18 +698,14 @@ add_socks_outbound() {
                         }]
                     }
                 }]
-            ' "$CONFIG_JSON" > "$TMP_CONFIG" && mv "$TMP_CONFIG" "$CONFIG_JSON"
+            ' "$CONFIG_JSON" | sponge "$CONFIG_JSON"
         fi
-
-        # 读取更新后的配置
-        CONFIG_CONTENT=$(<"$CONFIG_JSON")
 
         # 选择要路由的 inbound
         local inbound_tags
         inbound_tags=$(jq -r '.inbounds[].tag // empty' "$CONFIG_JSON")
         if [[ -z "$inbound_tags" ]]; then
-            log "当前没有任何 inbound，无法路由。"
-            echo "如果之后添加 inbound，再自行编辑 routing。"
+            log "当前没有任何 inbound，无法自动设置路由。可日后手动修改 routing。"
         else
             echo "========== 请选择要路由到该代理链出站的 inbound =========="
             IFS=$'\n' read -rd '' -a inbound_array <<< "$inbound_tags"
@@ -638,25 +734,37 @@ add_socks_outbound() {
 
                     # 删除已有相关规则
                     jq --arg inbound_tag "$inbound_tag" '
-                        .routing.rules |= map(select(.inboundTag | index($inbound_tag) | not))
-                    ' "$CONFIG_JSON" > "$TMP_CONFIG" && mv "$TMP_CONFIG" "$CONFIG_JSON"
+                        if .routing and .routing.rules then
+                            .routing.rules |= map(select(.inboundTag | index($inbound_tag) | not))
+                        else
+                            .
+                        end
+                    ' "$CONFIG_JSON" | sponge "$CONFIG_JSON"
 
                     # 添加新的路由规则
                     jq --arg inbound_tag "$inbound_tag" --arg out_tag "$out_tag" '
-                        .routing.rules += [{
-                            "type": "field",
-                            "inboundTag": [$inbound_tag],
-                            "outboundTag": $out_tag
-                        }]
-                    ' "$CONFIG_JSON" > "$TMP_CONFIG" && mv "$TMP_CONFIG" "$CONFIG_JSON"
+                        if .routing then
+                            .routing.rules += [{
+                                "type": "field",
+                                "inboundTag": [$inbound_tag],
+                                "outboundTag": $out_tag
+                            }]
+                        else
+                            .routing = {
+                                "domainStrategy": "AsIs",
+                                "rules": [{
+                                    "type": "field",
+                                    "inboundTag": [$inbound_tag],
+                                    "outboundTag": $out_tag
+                                }]
+                            }
+                        end
+                    ' "$CONFIG_JSON" | sponge "$CONFIG_JSON"
 
                     log "已为 inbound [$inbound_tag] 添加路由到 outbound [$out_tag]。"
                 done
             fi
         fi
-
-        # 读取更新后的配置
-        CONFIG_CONTENT=$(<"$CONFIG_JSON")
 
         if ! validate_config; then
             log "${RED}错误:${NC} 配置验证失败，已恢复备份。"
@@ -701,16 +809,19 @@ remove_socks_outbound() {
         backup_config
 
         # 删除 outbound
-        jq --arg del_tag "$del_tag" 'del(.outbounds[] | select(.tag == $del_tag))' "$CONFIG_JSON" > "$TMP_CONFIG" && mv "$TMP_CONFIG" "$CONFIG_JSON"
+        jq --arg del_tag "$del_tag" 'del(.outbounds[] | select(.tag == $del_tag))' "$CONFIG_JSON" | sponge "$CONFIG_JSON"
 
         # 删除对应的 routing 规则
-        jq --arg del_tag "$del_tag" 'del(.routing.rules[]? | select(.outboundTag == $del_tag))' "$CONFIG_JSON" > "$TMP_CONFIG" && mv "$TMP_CONFIG" "$CONFIG_JSON"
+        jq --arg del_tag "$del_tag" '
+            if .routing and .routing.rules then
+                .routing.rules |= map(select(.outboundTag != $del_tag))
+            else
+                .
+            end
+        ' "$CONFIG_JSON" | sponge "$CONFIG_JSON"
 
         # 还原 IPv4 优先
         set_ipv4_priority "true"
-
-        # 读取更新后的配置
-        CONFIG_CONTENT=$(<"$CONFIG_JSON")
 
         if ! validate_config; then
             log "${RED}错误:${NC} 配置验证失败，已恢复备份。"
@@ -735,31 +846,24 @@ optimize_network() {
         cp /etc/sysctl.conf /etc/sysctl.conf.bak_${timestamp}
         log "已备份 /etc/sysctl.conf 至 /etc/sysctl.conf.bak_${timestamp}。"
 
-        # 定义优化参数
+        # 定义优化参数（去除 tcp_adv_win_scale=-2 等部分不稳定参数）
         read -r -d '' sysctl_params <<EOF
-# 网络优化参数
-net.ipv4.tcp_no_metrics_save=1
-net.ipv4.tcp_ecn=0
-net.ipv4.tcp_frto=0
-net.ipv4.tcp_mtu_probing=0
-net.ipv4.tcp_rfc1337=0
-net.ipv4.tcp_sack=1
-net.ipv4.tcp_fack=1
-net.ipv4.tcp_window_scaling=1
-net.ipv4.tcp_adv_win_scale=-2
-net.ipv4.tcp_moderate_rcvbuf=1
+# Xray网络优化参数
+# 基础 TCP/UDP 缓存
 net.core.rmem_max=33554432
 net.core.wmem_max=33554432
 net.ipv4.tcp_rmem=8192 262144 536870912
 net.ipv4.tcp_wmem=4096 16384 536870912
 net.ipv4.udp_rmem_min=8192
 net.ipv4.udp_wmem_min=8192
+
+# bbr
 net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=bbr
 EOF
 
-        # 移除旧参数
-        sed -i '/^# 网络优化参数$/,/^net\.ipv4\.tcp_congestion_control=bbr$/d' /etc/sysctl.conf
+        # 移除旧的相关注释块(简单示例)
+        sed -i '/^# Xray网络优化参数$/,/^net\.ipv4\.tcp_congestion_control=bbr$/d' /etc/sysctl.conf
 
         # 添加新参数
         echo "$sysctl_params" >> /etc/sysctl.conf
@@ -776,15 +880,15 @@ EOF
 # 显示配置信息
 show_config_info() {
     echo "---------- Xray 服务状态 ----------"
-    systemctl status xray --no-pager
+    saferun systemctl status xray --no-pager
     echo "----------------------------------"
 
     echo "正在获取本机 IP..."
     local ipv4 ipv6
     ipv4=$(curl -s4 ip.sb || echo "未检测到")
     ipv6=$(curl -s6 ip.sb || echo "未检测到")
-    echo "IPv4: ${ipv4:-"未检测到"}"
-    echo "IPv6: ${ipv6:-"未检测到"}"
+    echo "IPv4: ${ipv4}"
+    echo "IPv6: ${ipv6}"
 
     echo "========== 已配置的 INBOUND 列表 =========="
     jq -r '.inbounds[] | "tag: \(.tag), protocol: \(.protocol), port: \(.port)"' "$CONFIG_JSON"
@@ -819,7 +923,6 @@ manage_xray_service() {
                 ;;
             2)
                 restart_xray
-                log "Xray 服务已立即重启。"
                 ;;
             0)
                 break
@@ -841,15 +944,38 @@ uninstall_xray() {
         return
     fi
 
-    systemctl stop xray
-    systemctl disable xray
+    # 停止并禁用 Xray 服务
+    systemctl stop xray 2>/dev/null || true
+    systemctl disable xray 2>/dev/null || true
+
+    # 删除 crontab 中的自动重启任务
     crontab -l 2>/dev/null | grep -v 'systemctl restart xray' | crontab -
+
+    # 删除 Xray 配置文件
     rm -rf /usr/local/etc/xray
+
+    # 删除 Xray 二进制文件
     rm -f /usr/local/bin/xray
+
+    # 删除 Xray 服务文件
     rm -f /etc/systemd/system/xray.service
-    systemctl daemon-reload || true
+
+    # 删除 Xray 日志文件
     rm -rf /var/log/xray
-    log "Xray 已全部卸载并删除配置信息。"
+
+    # 删除 Xray 临时文件
+    rm -rf /tmp/xray
+
+    # 删除 Xray 安装脚本
+    rm -f /tmp/xray-install.sh
+
+    # 删除 Xray 相关环境变量（如果存在）
+    sed -i '/XRAY_/d' /etc/environment
+
+    # 重新加载 systemd
+    systemctl daemon-reload || true
+
+    log "Xray 已全部卸载并删除所有相关文件。"
 }
 
 # 主菜单
@@ -859,7 +985,7 @@ main_menu() {
         echo "=============== 主菜单 ==============="
         echo "1. Shadowsocks 入站管理（添加/删除）"
         echo "2. Socks5 入站管理（添加/删除）"
-        echo "3. 代理链 出站管理（添加/删除）"  
+        echo "3. 代理链 出站管理（添加/删除）"
         echo "4. 网络优化"
         echo "5. 显示 Xray 配置信息"
         echo "6. 管理 Xray 服务"
@@ -936,10 +1062,10 @@ main_menu() {
     done
 }
 
-# 主流程
 main() {
     check_root
     detect_distro
+    check_systemd
     install_dependencies
     init_config
     install_xray_if_needed
